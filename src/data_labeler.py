@@ -1,6 +1,7 @@
 """
 Interactive data labeling tool for tagging faces with names
 Allows users to review detected faces and assign names
+Updated with better error handling for large images
 """
 import json
 import logging
@@ -20,19 +21,28 @@ logger = logging.getLogger(__name__)
 class DataLabeler:
     """
     Interactive tool for labeling detected faces with names.
+    Includes automatic handling of large images to prevent memory errors.
     """
     
-    def __init__(self, training_dir: str = None):
+    def __init__(self, training_dir: str = None, max_image_size: int = None):
         """
         Initialize data labeler.
         
         Args:
             training_dir: Directory containing training images
+            max_image_size: Maximum image dimension for processing (default from config)
         """
         self.training_dir = Path(training_dir or config.TRAINING_DIR)
-        self.detector = FaceDetector()
+        
+        # Use max_image_size from parameter, config, or default to 1920
+        max_size = max_image_size or getattr(config, 'MAX_IMAGE_SIZE', 1920)
+        self.detector = FaceDetector(max_image_size=max_size)
+        
         self.annotations = {}
         self.annotation_file = self.training_dir / "annotations.json"
+        
+        # Track skipped images
+        self.skipped_images = []
         
         # Load existing annotations if available
         self.load_annotations()
@@ -44,6 +54,18 @@ class DataLabeler:
                 with open(self.annotation_file, 'r') as f:
                     self.annotations = json.load(f)
                 logger.info(f"Loaded {len(self.annotations)} existing annotations")
+                
+                # Print summary of existing annotations
+                total_faces = sum(len(faces) for faces in self.annotations.values())
+                labeled_faces = sum(
+                    sum(1 for face in faces if face.get('label'))
+                    for faces in self.annotations.values()
+                )
+                print(f"\nResuming from previous session:")
+                print(f"  - {len(self.annotations)} images already processed")
+                print(f"  - {labeled_faces}/{total_faces} faces labeled")
+                print(f"  - Will skip already-processed images\n")
+                
             except Exception as e:
                 logger.error(f"Error loading annotations: {str(e)}")
                 self.annotations = {}
@@ -69,7 +91,8 @@ class DataLabeler:
         print("  - For each detected face, enter the person's name")
         print("  - Press ENTER to skip a face")
         print("  - Type 'unknown' for faces you can't identify")
-        print("  - Type 'quit' to exit")
+        print("  - Type 'quit' to exit and save")
+        print("  - Progress auto-saves after each image")
         print("="*60 + "\n")
         
         # Get all images
@@ -79,11 +102,12 @@ class DataLabeler:
             print(f"No images found in {self.training_dir}")
             return
         
-        print(f"Found {len(image_files)} images\n")
+        print(f"Found {len(image_files)} total images\n")
         
         # Process each image
         total_faces = 0
         labeled_faces = 0
+        processed_images = 0
         
         for image_path in tqdm(image_files, desc="Processing images"):
             image_path_str = str(image_path)
@@ -94,17 +118,31 @@ class DataLabeler:
                 if existing_labels:
                     continue
             
-            # Detect faces
-            faces = self.detector.detect_faces(image_path_str)
+            # Detect faces with error handling
+            try:
+                faces = self.detector.detect_faces(image_path_str)
+            except MemoryError as e:
+                print(f"\n⚠️  Memory error processing {image_path.name}")
+                print(f"    This image is too large. Skipping...")
+                self.skipped_images.append(str(image_path))
+                continue
+            except Exception as e:
+                print(f"\n⚠️  Error processing {image_path.name}: {str(e)}")
+                self.skipped_images.append(str(image_path))
+                continue
             
             if not faces:
                 continue
+            
+            processed_images += 1
             
             # Load image for display info
             image = load_image(image_path_str)
             
             print(f"\n{'='*60}")
             print(f"Image: {image_path.name}")
+            if image is not None:
+                print(f"Size: {image.shape[1]}x{image.shape[0]}px")
             print(f"Detected {len(faces)} face(s)")
             print(f"{'='*60}")
             
@@ -130,6 +168,7 @@ class DataLabeler:
                     if label.lower() == 'quit':
                         print("\nSaving and exiting...")
                         self.save_annotations()
+                        self._print_session_summary(processed_images, total_faces, labeled_faces)
                         return
                     
                     if label == '' or label.lower() == 'unknown':
@@ -153,11 +192,26 @@ class DataLabeler:
             # Auto-save after each image
             self.save_annotations()
         
+        self._print_session_summary(processed_images, total_faces, labeled_faces)
+    
+    def _print_session_summary(self, processed_images: int, total_faces: int, labeled_faces: int):
+        """Print summary of labeling session."""
         print(f"\n{'='*60}")
-        print(f"Labeling complete!")
+        print(f"LABELING SESSION COMPLETE!")
+        print(f"{'='*60}")
+        print(f"Images processed this session: {processed_images}")
         print(f"Total faces detected: {total_faces}")
         print(f"Faces labeled: {labeled_faces}")
-        print(f"Annotations saved to: {self.annotation_file}")
+        
+        if self.skipped_images:
+            print(f"\n⚠️  Skipped {len(self.skipped_images)} images due to errors:")
+            for img in self.skipped_images[:5]:  # Show first 5
+                print(f"    - {Path(img).name}")
+            if len(self.skipped_images) > 5:
+                print(f"    ... and {len(self.skipped_images) - 5} more")
+            print("\n💡 Try reducing MAX_IMAGE_SIZE in config.py if you have memory issues")
+        
+        print(f"\nAnnotations saved to: {self.annotation_file}")
         print(f"{'='*60}\n")
     
     def label_images_visual(self):
@@ -184,6 +238,7 @@ class DataLabeler:
         
         total_faces = 0
         labeled_faces = 0
+        processed_images = 0
         
         for image_path in image_files:
             image_path_str = str(image_path)
@@ -194,11 +249,18 @@ class DataLabeler:
                 if existing_labels:
                     continue
             
-            # Detect faces
-            faces = self.detector.detect_faces(image_path_str)
+            # Detect faces with error handling
+            try:
+                faces = self.detector.detect_faces(image_path_str)
+            except (MemoryError, Exception) as e:
+                print(f"\n⚠️  Error processing {image_path.name}: {str(e)}")
+                self.skipped_images.append(str(image_path))
+                continue
             
             if not faces:
                 continue
+            
+            processed_images += 1
             
             # Load image
             image = load_image(image_path_str)
@@ -236,6 +298,7 @@ class DataLabeler:
                 if label.lower() == 'quit':
                     cv2.destroyAllWindows()
                     self.save_annotations()
+                    self._print_session_summary(processed_images, total_faces, labeled_faces)
                     return
                 
                 if label and label.lower() != 'unknown':
@@ -256,7 +319,7 @@ class DataLabeler:
             # Auto-save
             self.save_annotations()
         
-        print(f"\nLabeling complete! Labeled {labeled_faces}/{total_faces} faces")
+        self._print_session_summary(processed_images, total_faces, labeled_faces)
         cv2.destroyAllWindows()
     
     def get_labeled_data(self) -> Dict[str, List]:
@@ -295,6 +358,9 @@ class DataLabeler:
         
         for person, faces in sorted(labeled_data.items()):
             print(f"  {person}: {len(faces)} faces")
+        
+        if self.skipped_images:
+            print(f"\n⚠️  {len(self.skipped_images)} images skipped due to errors")
         
         print("="*60 + "\n")
 

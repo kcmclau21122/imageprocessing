@@ -204,9 +204,9 @@ class ModelTrainer:
                 
                 # Check if meets requirement
                 if accuracy >= 0.75:
-                    print(f"✓ Model meets the 75% accuracy requirement!")
+                    print(f"âœ“ Model meets the 75% accuracy requirement!")
                 else:
-                    print(f"✗ Model accuracy below 75% threshold")
+                    print(f"âœ— Model accuracy below 75% threshold")
         
         # Save model
         print("\nSaving model...")
@@ -230,17 +230,46 @@ class ModelTrainer:
             Tuple of (train_embeddings, train_labels, test_embeddings, test_labels)
         """
         from sklearn.model_selection import train_test_split
+        from collections import Counter
         
         embeddings = np.array(self.recognizer.embeddings)
         labels = np.array(self.recognizer.labels)
         
-        # Stratified split to maintain class distribution
-        train_emb, test_emb, train_lbl, test_lbl = train_test_split(
-            embeddings, labels,
-            test_size=test_split,
-            stratify=labels,
-            random_state=42
-        )
+        # Check if stratified split is possible
+        label_counts = Counter(labels)
+        min_samples = min(label_counts.values())
+        
+        # Try stratified split if all classes have at least 2 samples
+        if min_samples >= 2:
+            try:
+                train_emb, test_emb, train_lbl, test_lbl = train_test_split(
+                    embeddings, labels,
+                    test_size=test_split,
+                    stratify=labels,
+                    random_state=42
+                )
+                logger.info("Using stratified train/test split")
+            except ValueError:
+                # Fallback to regular split
+                train_emb, test_emb, train_lbl, test_lbl = train_test_split(
+                    embeddings, labels,
+                    test_size=test_split,
+                    random_state=42
+                )
+                logger.warning("Stratified split failed, using regular split")
+        else:
+            # Use regular split when some classes have only 1 sample
+            train_emb, test_emb, train_lbl, test_lbl = train_test_split(
+                embeddings, labels,
+                test_size=test_split,
+                random_state=42
+            )
+            people_with_one_sample = [name for name, count in label_counts.items() if count == 1]
+            logger.warning(f"Using regular split (not stratified) because {len(people_with_one_sample)} people have only 1 face")
+            print(f"Note: The following people have only 1 labeled face:")
+            for person in people_with_one_sample:
+                print(f"  - {person}")
+            print("Consider adding more photos of these people for better training.")
         
         return (
             train_emb.tolist(),
@@ -324,4 +353,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

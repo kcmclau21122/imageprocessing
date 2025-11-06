@@ -1,6 +1,7 @@
 """
 Face detection module using multiple backends
 Supports DeepFace with various detectors (MTCNN, RetinaFace, etc.)
+Includes automatic image resizing to prevent memory issues with large images
 """
 import logging
 from typing import List, Tuple, Dict, Optional
@@ -17,29 +18,91 @@ logger = logging.getLogger(__name__)
 
 class FaceDetector:
     """
-    Face detection class supporting multiple backends.
+    Face detection class supporting multiple backends with automatic
+    image resizing to handle large images without memory errors.
     """
     
-    def __init__(self, backend: str = None):
+    def __init__(self, backend: str = None, max_image_size: int = 1920):
         """
         Initialize face detector.
         
         Args:
             backend: Detection backend ('mtcnn', 'retinaface', 'opencv', 'ssd', 'dlib')
+            max_image_size: Maximum dimension (width or height) for processing.
+                          Images larger than this will be resized to prevent memory issues.
+                          Default is 1920 (Full HD). Increase for higher resolution if you have more RAM.
         """
         self.backend = backend or config.FACE_DETECTION_BACKEND
         self.min_face_size = config.MIN_FACE_SIZE
+        self.max_image_size = max_image_size
         
         # Initialize MTCNN detector if using that backend
         if self.backend == 'mtcnn':
             self.mtcnn_detector = MTCNN()
-            logger.info("Initialized MTCNN face detector")
+            logger.info(f"Initialized MTCNN face detector (max image size: {max_image_size}px)")
         else:
-            logger.info(f"Using DeepFace with {self.backend} backend")
+            logger.info(f"Using DeepFace with {self.backend} backend (max image size: {max_image_size}px)")
+    
+    def _resize_if_needed(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Resize image if it's too large, maintaining aspect ratio.
+        
+        Args:
+            image: Input image as numpy array
+            
+        Returns:
+            Tuple of (resized_image, scale_factor)
+            scale_factor is 1.0 if no resizing was needed
+        """
+        height, width = image.shape[:2]
+        max_dimension = max(height, width)
+        
+        if max_dimension <= self.max_image_size:
+            # No resizing needed
+            return image, 1.0
+        
+        # Calculate scale factor
+        scale_factor = self.max_image_size / max_dimension
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        
+        # Resize image
+        resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height} (scale: {scale_factor:.2f})")
+        
+        return resized, scale_factor
+    
+    def _scale_boxes(self, faces: List[Dict], scale_factor: float) -> List[Dict]:
+        """
+        Scale face bounding boxes back to original image coordinates.
+        
+        Args:
+            faces: List of face dictionaries with boxes
+            scale_factor: Scale factor used for resizing
+            
+        Returns:
+            List of face dictionaries with scaled boxes
+        """
+        if scale_factor == 1.0:
+            return faces
+        
+        for face in faces:
+            x, y, w, h = face['box']
+            
+            # Scale back to original coordinates
+            face['box'] = [
+                int(x / scale_factor),
+                int(y / scale_factor),
+                int(w / scale_factor),
+                int(h / scale_factor)
+            ]
+        
+        return faces
     
     def detect_faces(self, image_path: str) -> List[Dict]:
         """
-        Detect faces in an image.
+        Detect faces in an image with automatic resizing for large images.
         
         Args:
             image_path: Path to the image file
@@ -55,22 +118,32 @@ class FaceDetector:
                 logger.error(f"Failed to load image: {image_path}")
                 return []
             
+            # Check image size and log if it's large
+            height, width = image.shape[:2]
+            if max(height, width) > self.max_image_size:
+                logger.info(f"Processing large image: {width}x{height}px from {image_path}")
+            
             # Detect faces using selected backend
             if self.backend == 'mtcnn':
-                return self._detect_with_mtcnn(image)
+                return self._detect_with_mtcnn(image, image_path)
             else:
                 return self._detect_with_deepface(image_path)
                 
+        except MemoryError as e:
+            logger.error(f"Memory error processing {image_path}: {str(e)}")
+            logger.error(f"Try reducing MAX_IMAGE_SIZE in config or use a different backend")
+            return []
         except Exception as e:
             logger.error(f"Error detecting faces in {image_path}: {str(e)}")
             return []
     
-    def _detect_with_mtcnn(self, image: np.ndarray) -> List[Dict]:
+    def _detect_with_mtcnn(self, image: np.ndarray, image_path: str) -> List[Dict]:
         """
-        Detect faces using MTCNN detector.
+        Detect faces using MTCNN detector with automatic resizing.
         
         Args:
             image: Input image as numpy array
+            image_path: Path to original image (for extracting full-resolution faces)
             
         Returns:
             List of face dictionaries
@@ -78,21 +151,44 @@ class FaceDetector:
         faces = []
         
         try:
-            # Detect faces
-            detections = self.mtcnn_detector.detect_faces(image)
+            # Resize image if needed
+            resized_image, scale_factor = self._resize_if_needed(image)
+            
+            # Detect faces on resized image
+            try:
+                detections = self.mtcnn_detector.detect_faces(resized_image)
+            except MemoryError as e:
+                logger.error(f"MTCNN memory error even after resizing. Image may still be too large.")
+                logger.error(f"Try reducing max_image_size further or use 'opencv' backend instead")
+                return []
             
             for detection in detections:
-                # Extract bounding box
+                # Extract bounding box from resized image
                 x, y, w, h = detection['box']
                 confidence = detection['confidence']
                 
-                # Filter by minimum size and confidence
-                if w >= self.min_face_size and h >= self.min_face_size:
-                    # Extract face region
-                    face_img = image[y:y+h, x:x+w]
+                # Scale box back to original image coordinates
+                if scale_factor != 1.0:
+                    x_orig = int(x / scale_factor)
+                    y_orig = int(y / scale_factor)
+                    w_orig = int(w / scale_factor)
+                    h_orig = int(h / scale_factor)
+                else:
+                    x_orig, y_orig, w_orig, h_orig = x, y, w, h
+                
+                # Filter by minimum size
+                if w_orig >= self.min_face_size and h_orig >= self.min_face_size:
+                    # Extract face region from ORIGINAL image for best quality
+                    # Ensure coordinates are within bounds
+                    y_start = max(0, y_orig)
+                    y_end = min(image.shape[0], y_orig + h_orig)
+                    x_start = max(0, x_orig)
+                    x_end = min(image.shape[1], x_orig + w_orig)
+                    
+                    face_img = image[y_start:y_end, x_start:x_end]
                     
                     faces.append({
-                        'box': [x, y, w, h],
+                        'box': [x_orig, y_orig, w_orig, h_orig],
                         'confidence': confidence,
                         'face_img': face_img,
                         'keypoints': detection.get('keypoints', {})
@@ -102,6 +198,7 @@ class FaceDetector:
             
         except Exception as e:
             logger.error(f"MTCNN detection error: {str(e)}")
+            logger.error(f"Consider switching to 'opencv' or 'retinaface' backend if problems persist")
         
         return faces
     
@@ -193,28 +290,38 @@ class FaceDetector:
         return faces
 
 
-def batch_detect_faces(image_paths: List[str], backend: str = None) -> Dict[str, List[Dict]]:
+def batch_detect_faces(image_paths: List[str], backend: str = None, 
+                      max_image_size: int = 1920) -> Dict[str, List[Dict]]:
     """
-    Detect faces in multiple images.
+    Detect faces in multiple images with memory-safe processing.
     
     Args:
         image_paths: List of image file paths
         backend: Detection backend to use
+        max_image_size: Maximum image dimension for processing
         
     Returns:
         Dictionary mapping image paths to lists of detected faces
     """
-    detector = FaceDetector(backend)
+    detector = FaceDetector(backend, max_image_size=max_image_size)
     results = {}
+    failed_images = []
     
     from tqdm import tqdm
     
     for image_path in tqdm(image_paths, desc="Detecting faces"):
-        faces = detector.detect_faces(image_path)
-        if faces:
-            results[image_path] = faces
+        try:
+            faces = detector.detect_faces(image_path)
+            if faces:
+                results[image_path] = faces
+        except Exception as e:
+            logger.error(f"Failed to process {image_path}: {str(e)}")
+            failed_images.append(image_path)
     
     total_faces = sum(len(faces) for faces in results.values())
     logger.info(f"Detected {total_faces} total faces in {len(results)} images")
+    
+    if failed_images:
+        logger.warning(f"Failed to process {len(failed_images)} images")
     
     return results

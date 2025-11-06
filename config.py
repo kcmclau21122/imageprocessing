@@ -31,10 +31,17 @@ FACE_DETECTION_BACKEND = os.getenv("FACE_DETECTION_BACKEND", "mtcnn")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Facenet512")
 
-# Training Configuration
+# Image Processing Configuration
 MIN_FACE_SIZE = int(os.getenv("MIN_FACE_SIZE", "20"))
 IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "160"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
+
+# Maximum image dimension for face detection to prevent memory errors
+# Images larger than this will be resized before processing
+# Default: 1920 (Full HD)
+# Increase if you have more RAM and want to process higher resolution images
+# Decrease if you encounter memory errors (try 1280 or 960)
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "1920"))
 
 # Supported image formats
 SUPPORTED_FORMATS = ['.jpg', '.jpeg', '.png', '.bmp', '.heic', '.gif']
