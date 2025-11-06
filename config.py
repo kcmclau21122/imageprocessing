@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+from pathlib import Path
+DLIB_SHAPE_PREDICTOR = Path(__file__).parent / "shape_predictor_68_face_landmarks.dat"
+
 # Load environment variables
 load_dotenv()
 

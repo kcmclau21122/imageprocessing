@@ -1,68 +1,108 @@
 """
-Training script for face recognition model
-Loads labeled data and trains the classifier
+Train face recognition model using DeepFace embeddings and machine learning classifiers.
+Now includes:
+ - Albumentations-based image augmentation during training
+ - Optional dlib-based face alignment for consistent embeddings
 """
+
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List
+import argparse
+from typing import Dict, List, Tuple
 import numpy as np
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import classification_report, accuracy_score
 
+import cv2
 import config
 from src.face_recognition import FaceRecognizer
 from src.utils import load_image
 
 logger = logging.getLogger(__name__)
 
+# Optional dependencies
+try:
+    import dlib
+    HAS_DLIB = True
+except Exception:
+    dlib = None
+    HAS_DLIB = False
+
+try:
+    from albumentations import Compose, HorizontalFlip, RandomBrightnessContrast, Rotate
+    HAS_AUG = True
+except Exception:
+    Compose = None
+    HAS_AUG = False
+
 
 class ModelTrainer:
     """
-    Trainer for face recognition model.
+    Handles preparing data, extracting embeddings, and training the recognizer.
     """
-    
-    def __init__(self, training_dir: str = None, model_name: str = None):
-        """
-        Initialize trainer.
-        
-        Args:
-            training_dir: Directory containing training images and annotations
-            model_name: Embedding model name
-        """
-        self.training_dir = Path(training_dir or config.TRAINING_DIR)
-        self.annotation_file = self.training_dir / "annotations.json"
-        self.recognizer = FaceRecognizer(model_name)
-        self.annotations = {}
-    
-    def load_annotations(self) -> bool:
-        """
-        Load annotations from file.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            if not self.annotation_file.exists():
-                logger.error(f"Annotations file not found: {self.annotation_file}")
-                return False
-            
-            with open(self.annotation_file, 'r') as f:
-                self.annotations = json.load(f)
-            
-            logger.info(f"Loaded annotations from {self.annotation_file}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error loading annotations: {str(e)}")
-            return False
-    
+
+    def __init__(self, model_name: str = None, classifier_type: str = 'svm'):
+        self.annotation_file = Path(config.TRAINING_DIR) / "annotations.json"
+        self.model_name = model_name or config.EMBEDDING_MODEL
+        self.classifier_type = classifier_type
+        self.recognizer = FaceRecognizer(model_name=self.model_name)
+        self.shape_predictor = None
+
+        # Try loading dlib predictor
+        if HAS_DLIB:
+            predictor_path = Path(getattr(config, 'DLIB_SHAPE_PREDICTOR', 'shape_predictor_68_face_landmarks.dat'))
+            if predictor_path.exists():
+                try:
+                    self.shape_predictor = dlib.shape_predictor(str(predictor_path))
+                    logger.info(f"Loaded dlib shape predictor: {predictor_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load dlib predictor: {e}")
+            else:
+                logger.warning("dlib shape predictor not found — using simple cropping.")
+        else:
+            logger.warning("dlib not available — skipping alignment.")
+
+        # Prepare augmentation
+        if HAS_AUG:
+            self.augment = Compose([
+                HorizontalFlip(p=0.5),
+                RandomBrightnessContrast(p=0.4),
+                Rotate(limit=8, p=0.3)
+            ])
+            logger.info("Albumentations augmentation enabled.")
+        else:
+            self.augment = None
+            logger.warning("Albumentations not installed — skipping augmentation.")
+
+    # -----------------------------
+    # Face alignment and cropping
+    # -----------------------------
+    def align_or_crop(self, img: np.ndarray, box: List[int]) -> np.ndarray:
+        """Try to align using dlib, else fall back to simple crop."""
+        x, y, w, h = box
+        ih, iw = img.shape[:2]
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(iw, int(x + w)), min(ih, int(y + h))
+
+        if self.shape_predictor is not None:
+            try:
+                rect = dlib.rectangle(x1, y1, x2, y2)
+                shape = self.shape_predictor(img, rect)
+                chips = dlib.get_face_chips(img, [shape], size=160)
+                if chips:
+                    return chips[0]
+            except Exception as e:
+                logger.debug(f"Alignment failed for box {box}: {e}")
+
+        return img[y1:y2, x1:x2]
+
+    # -----------------------------
+    # Training data preparation
+    # -----------------------------
     def prepare_training_data(self) -> Dict[str, int]:
-        """
-        Extract faces and embeddings from labeled data.
-        
-        Returns:
-            Dictionary with statistics about the training data
-        """
+        """Extract faces, apply augmentation, and compute embeddings."""
         stats = {
             'total_images': 0,
             'total_faces': 0,
@@ -70,285 +110,172 @@ class ModelTrainer:
             'unique_people': 0,
             'failed_extractions': 0
         }
-        
-        print("\nPreparing training data...")
-        
-        labeled_data = {}
-        
-        # Collect all labeled faces
-        for image_path, faces in self.annotations.items():
+
+        try:
+            with open(self.annotation_file, 'r') as f:
+                annotations = json.load(f)
+        except Exception:
+            logger.error(f"Could not read {self.annotation_file}")
+            return stats
+
+        people = set()
+
+        for image_path_str, faces in tqdm(annotations.items(), desc="Preparing faces"):
             stats['total_images'] += 1
-            
-            for face in faces:
+            image = load_image(image_path_str)
+            if image is None:
+                stats['failed_extractions'] += len(faces)
+                continue
+
+            for face_info in faces:
                 stats['total_faces'] += 1
-                
-                label = face.get('label')
-                if not label:
+                person = face_info.get('label')
+                if not person:
                     continue
-                
+                people.add(person)
                 stats['labeled_faces'] += 1
-                
-                if label not in labeled_data:
-                    labeled_data[label] = []
-                
-                labeled_data[label].append({
-                    'image_path': image_path,
-                    'box': face['box']
-                })
-        
-        stats['unique_people'] = len(labeled_data)
-        
-        print(f"Found {stats['labeled_faces']} labeled faces for {stats['unique_people']} people")
-        
-        # Extract embeddings for each face
-        print("\nExtracting face embeddings...")
-        
-        for person, face_list in tqdm(labeled_data.items(), desc="Processing people"):
-            for face_info in tqdm(face_list, desc=f"  {person}", leave=False):
-                # Load image
-                image = load_image(face_info['image_path'])
-                
-                if image is None:
+
+                try:
+                    x, y, w, h = face_info['box']
+                    face_img = self.align_or_crop(image, (x, y, w, h))
+                except Exception as e:
+                    logger.debug(f"Face crop failed for {image_path_str}: {e}")
                     stats['failed_extractions'] += 1
                     continue
-                
-                # Extract face region
-                x, y, w, h = face_info['box']
-                face_img = image[y:y+h, x:x+w]
-                
-                # Add to training data
+
+                # Add original face
                 success = self.recognizer.add_face(face_img, person)
-                
                 if not success:
                     stats['failed_extractions'] += 1
-        
+
+                # Add augmented versions (training only)
+                if self.augment is not None:
+                    for _ in range(2):
+                        try:
+                            aug_img = self.augment(image=face_img)['image']
+                            self.recognizer.add_face(aug_img, person)
+                        except Exception as e:
+                            logger.debug(f"Augmentation failed: {e}")
+
+        stats['unique_people'] = len(people)
         return stats
-    
-    def train(self, classifier_type: str = 'svm', test_split: float = 0.2) -> Dict:
-        """
-        Train the face recognition model.
-        
-        Args:
-            classifier_type: Type of classifier to use
-            test_split: Fraction of data to use for testing
-            
-        Returns:
-            Dictionary with training results
-        """
-        print("\n" + "="*60)
-        print("TRAINING FACE RECOGNITION MODEL")
-        print("="*60)
-        
-        # Load annotations
-        if not self.load_annotations():
-            return {'success': False, 'error': 'Failed to load annotations'}
-        
-        # Prepare training data
+
+    # -----------------------------
+    # Model training
+    # -----------------------------
+    def train(self) -> Tuple[Dict, float]:
+        """Train and evaluate model."""
         stats = self.prepare_training_data()
-        
-        print(f"\nTraining data statistics:")
-        print(f"  Total images: {stats['total_images']}")
-        print(f"  Total faces detected: {stats['total_faces']}")
-        print(f"  Labeled faces: {stats['labeled_faces']}")
-        print(f"  Unique people: {stats['unique_people']}")
-        print(f"  Failed extractions: {stats['failed_extractions']}")
-        
         if stats['labeled_faces'] == 0:
-            print("\nNo labeled data found. Please run the labeling tool first.")
-            return {'success': False, 'error': 'No labeled data'}
-        
-        # Split data for validation
-        if test_split > 0:
-            print(f"\nSplitting data ({int((1-test_split)*100)}% train, {int(test_split*100)}% test)...")
-            train_embeddings, train_labels, test_embeddings, test_labels = self._split_data(test_split)
+            logger.error("No labeled faces found.")
+            return stats, 0.0
+
+        logger.info(f"Training {self.classifier_type} classifier on {stats['labeled_faces']} faces.")
+        success = self.recognizer.train(classifier_type=self.classifier_type)
+        accuracy = 0.0
+        if success:
+            logger.info("Model trained successfully.")
+            accuracy = self.evaluate_split()
         else:
-            train_embeddings = self.recognizer.embeddings
-            train_labels = self.recognizer.labels
-            test_embeddings = []
-            test_labels = []
-        
-        print(f"Training samples: {len(train_embeddings)}")
-        print(f"Testing samples: {len(test_embeddings)}")
-        
-        # Train classifier
-        print(f"\nTraining {classifier_type} classifier...")
-        
-        # Temporarily set embeddings to training set
-        original_embeddings = self.recognizer.embeddings
-        original_labels = self.recognizer.labels
-        self.recognizer.embeddings = train_embeddings
-        self.recognizer.labels = train_labels
-        
-        success = self.recognizer.train(classifier_type)
-        
-        # Restore full dataset
-        self.recognizer.embeddings = original_embeddings
-        self.recognizer.labels = original_labels
-        
-        if not success:
-            return {'success': False, 'error': 'Training failed'}
-        
-        # Evaluate on test set if available
-        results = {'success': True, 'stats': stats}
-        
-        if test_embeddings:
-            print("\nEvaluating on test set...")
-            eval_results = self.recognizer.evaluate(test_embeddings, test_labels)
-            
-            if eval_results:
-                accuracy = eval_results['accuracy']
-                print(f"\nTest Accuracy: {accuracy:.2%}")
-                
-                results['test_accuracy'] = accuracy
-                results['evaluation'] = eval_results
-                
-                # Check if meets requirement
-                if accuracy >= 0.75:
-                    print(f"âœ“ Model meets the 75% accuracy requirement!")
-                else:
-                    print(f"âœ— Model accuracy below 75% threshold")
-        
-        # Save model
-        print("\nSaving model...")
-        self.recognizer.save_model()
-        print(f"Model saved to {config.MODELS_DIR}")
-        
-        print("\n" + "="*60)
-        print("TRAINING COMPLETE")
-        print("="*60 + "\n")
-        
-        return results
-    
-    def _split_data(self, test_split: float) -> tuple:
-        """
-        Split data into training and testing sets.
-        
-        Args:
-            test_split: Fraction of data to use for testing
-            
-        Returns:
-            Tuple of (train_embeddings, train_labels, test_embeddings, test_labels)
-        """
-        from sklearn.model_selection import train_test_split
-        from collections import Counter
-        
-        embeddings = np.array(self.recognizer.embeddings)
-        labels = np.array(self.recognizer.labels)
-        
-        # Check if stratified split is possible
-        label_counts = Counter(labels)
-        min_samples = min(label_counts.values())
-        
-        # Try stratified split if all classes have at least 2 samples
-        if min_samples >= 2:
-            try:
-                train_emb, test_emb, train_lbl, test_lbl = train_test_split(
-                    embeddings, labels,
-                    test_size=test_split,
-                    stratify=labels,
-                    random_state=42
-                )
-                logger.info("Using stratified train/test split")
-            except ValueError:
-                # Fallback to regular split
-                train_emb, test_emb, train_lbl, test_lbl = train_test_split(
-                    embeddings, labels,
-                    test_size=test_split,
-                    random_state=42
-                )
-                logger.warning("Stratified split failed, using regular split")
-        else:
-            # Use regular split when some classes have only 1 sample
-            train_emb, test_emb, train_lbl, test_lbl = train_test_split(
-                embeddings, labels,
-                test_size=test_split,
-                random_state=42
-            )
-            people_with_one_sample = [name for name, count in label_counts.items() if count == 1]
-            logger.warning(f"Using regular split (not stratified) because {len(people_with_one_sample)} people have only 1 face")
-            print(f"Note: The following people have only 1 labeled face:")
-            for person in people_with_one_sample:
-                print(f"  - {person}")
-            print("Consider adding more photos of these people for better training.")
-        
-        return (
-            train_emb.tolist(),
-            train_lbl.tolist(),
-            test_emb.tolist(),
-            test_lbl.tolist()
-        )
-    
-    def cross_validate(self, n_splits: int = 5) -> Dict:
-        """
-        Perform cross-validation on the model.
-        
-        Args:
-            n_splits: Number of CV folds
-            
-        Returns:
-            Dictionary with CV results
-        """
-        from sklearn.model_selection import cross_val_score
-        
-        print(f"\nPerforming {n_splits}-fold cross-validation...")
-        
-        if not self.load_annotations():
-            return {'success': False}
-        
-        self.prepare_training_data()
-        
+            logger.error("Training failed.")
+        return stats, accuracy
+
+    # -----------------------------
+    # Cross-validation
+    # -----------------------------
+    def cross_validate(self, n_splits: int = 5) -> float:
+        """Perform k-fold cross-validation."""
         X = np.array(self.recognizer.embeddings)
-        y = self.recognizer.label_encoder.fit_transform(self.recognizer.labels)
-        
-        # Initialize classifier
-        from sklearn.svm import SVC
-        classifier = SVC(kernel='linear', probability=True)
-        
-        # Perform CV
-        scores = cross_val_score(classifier, X, y, cv=n_splits, scoring='accuracy')
-        
-        print(f"Cross-validation scores: {scores}")
-        print(f"Mean accuracy: {scores.mean():.2%} (+/- {scores.std() * 2:.2%})")
-        
-        return {
-            'success': True,
-            'scores': scores.tolist(),
-            'mean_accuracy': scores.mean(),
-            'std_accuracy': scores.std()
-        }
+        y = np.array(self.recognizer.labels)
+        y_encoded = self.recognizer.label_encoder.fit_transform(y)
 
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        scores = []
 
-def main():
-    """Main function for training the model."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Train face recognition model')
-    parser.add_argument('--model', type=str, default='Facenet512',
-                       help='Embedding model (Facenet512, ArcFace, VGG-Face, etc.)')
-    parser.add_argument('--classifier', type=str, default='svm',
-                       choices=['svm', 'knn', 'random_forest'],
-                       help='Classifier type')
-    parser.add_argument('--test-split', type=float, default=0.2,
-                       help='Fraction of data for testing (0.0 to 1.0)')
-    parser.add_argument('--cross-validate', action='store_true',
-                       help='Perform cross-validation')
-    
-    args = parser.parse_args()
-    
-    # Initialize trainer
-    trainer = ModelTrainer(model_name=args.model)
-    
-    if args.cross_validate:
-        # Run cross-validation
-        results = trainer.cross_validate()
-    else:
-        # Train model
-        results = trainer.train(
-            classifier_type=args.classifier,
-            test_split=args.test_split
+        for train_idx, test_idx in skf.split(X, y_encoded):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y_encoded[train_idx], y_encoded[test_idx]
+
+            self.recognizer.classifier.fit(X_train, y_train)
+            preds = self.recognizer.classifier.predict(X_test)
+            acc = accuracy_score(y_test, preds)
+            scores.append(acc)
+
+        mean_acc = float(np.mean(scores))
+        logger.info(f"{n_splits}-fold cross-validation accuracy: {mean_acc:.2%}")
+        return mean_acc
+
+    # -----------------------------
+    # Holdout evaluation
+    # -----------------------------
+    def evaluate_split(self, test_size: float = 0.2) -> float:
+        """Split embeddings and evaluate accuracy on holdout set."""
+        X = np.array(self.recognizer.embeddings)
+        y = np.array(self.recognizer.labels)
+        y_encoded = self.recognizer.label_encoder.fit_transform(y)
+
+        if len(np.unique(y_encoded)) < 2:
+            logger.warning("Not enough classes for evaluation.")
+            return 0.0
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_encoded, test_size=test_size, stratify=y_encoded, random_state=42
         )
-    
-    return results
+
+        self.recognizer.classifier.fit(X_train, y_train)
+        preds = self.recognizer.classifier.predict(X_test)
+        acc = accuracy_score(y_test, preds)
+        
+        # Get the actual classes present in the test data
+        unique_labels = np.unique(np.concatenate([y_test, preds]))
+        available_classes = self.recognizer.label_encoder.inverse_transform(unique_labels)
+        
+        report = classification_report(
+            y_test, preds,
+            target_names=available_classes,  # Use only classes present in test data
+            digits=3
+        )
+
+        print("\n" + "=" * 60)
+        print("EVALUATION REPORT")
+        print("=" * 60)
+        print(report)
+        print("=" * 60 + "\n")
+
+        logger.info(f"Holdout accuracy: {acc:.2%}")
+        return acc
+
+
+
+# -----------------------------
+# CLI entry point
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Train face recognition model with augmentation/alignment")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Embedding model (ArcFace, Facenet, etc.)")
+    parser.add_argument("--classifier", type=str, default="svm",
+                        choices=["svm", "knn", "random_forest"],
+                        help="Classifier type")
+    parser.add_argument("--cross-validate", action="store_true",
+                        help="Run 5-fold cross-validation instead of holdout")
+    args = parser.parse_args()
+
+    trainer = ModelTrainer(model_name=args.model, classifier_type=args.classifier)
+    stats, _ = trainer.train()
+
+    if args.cross_validate:
+        mean_acc = trainer.cross_validate()
+        print(f"\nCross-validation mean accuracy: {mean_acc:.2%}")
+
+    print("\n" + "=" * 60)
+    print("TRAINING SUMMARY")
+    print("=" * 60)
+    for k, v in stats.items():
+        print(f"{k:20}: {v}")
+    print("=" * 60 + "\n")
+
+    trainer.recognizer.save_model()
 
 
 if __name__ == "__main__":

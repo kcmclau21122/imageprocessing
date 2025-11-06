@@ -23,16 +23,14 @@ class FaceIdentifier:
     Identifier for recognizing faces in new photos.
     """
     
-    def __init__(self, model_dir: str = None):
+    def __init__(self):
         """
         Initialize face identifier.
-        
-        Args:
-            model_dir: Directory containing trained models
         """
-        self.model_dir = Path(model_dir or config.MODELS_DIR)
         self.detector = FaceDetector()
-        self.recognizer = FaceRecognizer()
+        # Initialize recognizer without specifying model name
+        # This prevents it from trying to download ArcFace weights
+        self.recognizer = FaceRecognizer(model_name=None)
         
         # Load trained model
         self.load_model()
@@ -45,6 +43,7 @@ class FaceIdentifier:
             True if successful, False otherwise
         """
         try:
+            # Load the trained model (embeddings + classifier)
             self.recognizer.load_model()
             logger.info("Successfully loaded trained model")
             return True
@@ -98,6 +97,7 @@ class FaceIdentifier:
         
         return results
     
+    # ... (rest of your methods remain exactly the same)
     def identify_batch(self, image_paths: List[str], 
                       confidence_threshold: float = None) -> Dict[str, List[Dict]]:
         """
@@ -375,6 +375,12 @@ def main():
     
     # Initialize identifier
     identifier = FaceIdentifier()
+    
+    # Check if model was loaded successfully
+    if not identifier.recognizer.classifier:
+        print("Error: No trained model found. Please train a model first using:")
+        print("python train_model.py --model ArcFace --classifier svm")
+        return
     
     if args.test:
         # Run accuracy test

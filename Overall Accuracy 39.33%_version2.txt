@@ -1,0 +1,23 @@
+Overall Accuracy: 39.33%
+Correct: 59/150
+
+Per-Person Accuracy:
+  Amelia: 50.00% (13/26)
+  Ashley: 50.00% (1/2)
+  Barry: 0.00% (0/1)
+  Bev: 75.00% (3/4)
+  Cheryl: 57.89% (11/19)
+  Clara: 26.67% (8/30)
+  Dawn: 0.00% (0/1)
+  Jack: 27.27% (3/11)
+  Jacob: 0.00% (0/1)
+  John: 100.00% (1/1)
+  Josh: 0.00% (0/1)
+  Kendric: 12.50% (1/8)
+  Kevin: 33.33% (4/12)
+  Kyle: 20.00% (1/5)
+  Laurin: 0.00% (0/5)
+  Mac: 100.00% (4/4)
+  Mandy: 56.25% (9/16)
+  Shane: 0.00% (0/2)
+  \: 0.00% (0/1)

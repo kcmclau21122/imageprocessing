@@ -10,6 +10,7 @@ from typing import Dict, List
 import cv2
 import numpy as np
 from tqdm import tqdm
+from pathlib import Path
 
 import config
 from src.face_detection import FaceDetector
@@ -369,14 +370,17 @@ def main():
     """Main function for running the labeling tool."""
     import sys
     
-    # Check if training directory has images
-    if not config.TRAINING_DIR.exists():
-        print(f"Training directory not found: {config.TRAINING_DIR}")
-        print("Please create the directory and add your training images.")
+    custom_dir = input("Enter the folder path containing images to label: ").strip()
+    if not custom_dir:
+        custom_dir = str(config.TRAINING_DIR)  # fallback to default if blank
+
+    custom_path = Path(custom_dir)
+    if not custom_path.exists():
+        print(f"❌ Directory not found: {custom_dir}")
         return
-    
-    # Initialize labeler
-    labeler = DataLabeler()
+
+    # Initialize labeler with user-specified directory
+    labeler = DataLabeler(training_dir=custom_path)
     
     # Choose interface
     print("\nSelect labeling interface:")

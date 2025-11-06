@@ -16,6 +16,7 @@ ENV/
 # Training data (personal photos)
 data/training/**
 !data/training/.gitkeep
+*.dat
 
 # Testing data
 data/testing/**
