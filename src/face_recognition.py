@@ -16,7 +16,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from deepface import DeepFace
 import torch
 
-import config
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ class FaceRecognizer:
             logger.error(f"Error adding face: {str(e)}")
             return False
     
-    def train(self, classifier_type: str = 'svm') -> bool:
+    def train(self, classifier_type: str = 'svm', class_weight=None) -> bool:
         """
         Train the classifier on collected embeddings.
         
@@ -123,7 +123,9 @@ class FaceRecognizer:
             
             # Initialize classifier
             if classifier_type == 'svm':
-                self.classifier = SVC(kernel='linear', probability=True, C=1.0)
+                # Use RBF kernel for better non-linear pattern recognition
+                # gamma='scale' uses 1/(n_features * X.var()) as default
+                self.classifier = SVC(kernel='rbf', gamma='scale', probability=True, C=1.0, random_state=42)
             elif classifier_type == 'knn':
                 self.classifier = KNeighborsClassifier(n_neighbors=5, weights='distance')
             elif classifier_type == 'random_forest':
@@ -141,32 +143,34 @@ class FaceRecognizer:
             logger.error(f"Error training classifier: {str(e)}")
             return False
     
-    def predict(self, face_img: np.ndarray, return_confidence: bool = True) -> Tuple[Optional[str], float]:
+    def predict(self, face_img: np.ndarray, return_confidence: bool = True,
+                confidence_threshold: float = None) -> Tuple[Optional[str], float]:
         """
-        Predict the identity of a face.
-        
+        Predict the identity of a face with confidence thresholding.
+
         Args:
             face_img: Face image as numpy array
             return_confidence: Whether to return confidence score
-            
+            confidence_threshold: Minimum confidence threshold (uses config default if None)
+
         Returns:
-            Tuple of (predicted_label, confidence) or (None, 0.0) if prediction fails
+            Tuple of (predicted_label, confidence) or ("Unknown", confidence) if below threshold
         """
         try:
             if self.classifier is None:
                 logger.error("Classifier not trained")
                 return None, 0.0
-            
+
             # Extract embedding
             embedding = self.extract_embedding(face_img)
-            
+
             if embedding is None:
                 return None, 0.0
-            
+
             # Predict
             embedding = embedding.reshape(1, -1)
             prediction = self.classifier.predict(embedding)
-            
+
             # Get confidence
             if hasattr(self.classifier, 'predict_proba'):
                 proba = self.classifier.predict_proba(embedding)
@@ -175,12 +179,20 @@ class FaceRecognizer:
                 # For classifiers without predict_proba
                 decision = self.classifier.decision_function(embedding)
                 confidence = np.max(decision) / np.sum(np.abs(decision))
-            
+
+            # Apply confidence threshold
+            if confidence_threshold is None:
+                confidence_threshold = config.RECOGNITION_CONFIDENCE_THRESHOLD
+
+            if confidence < confidence_threshold:
+                logger.debug(f"Prediction confidence {confidence:.2%} below threshold {confidence_threshold:.2%}")
+                return "Unknown", confidence
+
             # Decode label
             label = self.label_encoder.inverse_transform(prediction)[0]
-            
+
             return label, confidence
-            
+
         except Exception as e:
             logger.error(f"Error predicting face: {str(e)}")
             return None, 0.0

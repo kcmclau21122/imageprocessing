@@ -13,7 +13,7 @@ from pillow_heif import register_heif_opener
 # Register HEIF opener for Pillow
 register_heif_opener()
 
-import config
+from . import config
 
 # Setup logging
 logging.basicConfig(
@@ -30,16 +30,21 @@ logger = logging.getLogger(__name__)
 def load_image(image_path: str) -> Optional[np.ndarray]:
     """
     Load an image from file, supporting multiple formats including HEIC.
-    
+    Handles both absolute and relative paths (relative paths are resolved from PROJECT_ROOT).
+
     Args:
-        image_path: Path to the image file
-        
+        image_path: Path to the image file (absolute or relative to PROJECT_ROOT)
+
     Returns:
         numpy.ndarray: Image in RGB format (or None if loading fails)
     """
     try:
         image_path = Path(image_path)
-        
+
+        # If path is not absolute, try to resolve it relative to PROJECT_ROOT
+        if not image_path.is_absolute():
+            image_path = Path(config.PROJECT_ROOT) / image_path
+
         if not image_path.exists():
             logger.error(f"Image not found: {image_path}")
             return None

@@ -10,8 +10,8 @@ import cv2
 from deepface import DeepFace
 from mtcnn import MTCNN
 
-import config
-from src.utils import load_image
+from . import config
+from .utils import load_image
 
 logger = logging.getLogger(__name__)
 
